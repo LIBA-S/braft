@@ -597,13 +597,8 @@ int Segment::unlink() {
             break;
         }
 
-        // start bthread to unlink
-        // TODO unlink follow control
         std::string* file_path = new std::string(tmp_path);
-        bthread_t tid;
-        if (bthread_start_background(&tid, &BTHREAD_ATTR_NORMAL, run_unlink, file_path) != 0) {
-            run_unlink(file_path);
-        }
+        run_unlink(file_path);
 
         LOG(INFO) << "Unlinked segment `" << path << '\'';
     } while (0);
