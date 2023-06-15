@@ -25,6 +25,7 @@
 #include <butil/file_util.h>
 #include <bthread/bthread.h>
 #include <brpc/controller.h>
+#include "braft/auth.h"
 #include "braft/util.h"
 #include "braft/snapshot.h"
 
@@ -69,6 +70,9 @@ int RemoteFileCopier::init(const std::string& uri, FileSystemAdaptor* fs,
     }
     brpc::ChannelOptions channel_opt;
     channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+    if (g_braft_auth_getter) {
+        channel_opt.auth = g_braft_auth_getter();
+    }
     if (_channel.Init(ip_and_port.as_string().c_str(), &channel_opt) != 0) {
         LOG(ERROR) << "Fail to init Channel to " << ip_and_port;
         return -1;
