@@ -21,6 +21,7 @@
 #include <brpc/controller.h>
 #include <brpc/channel.h>
 
+#include "braft/auth.h"
 #include "braft/errno.pb.h"
 #include "braft/util.h"
 #include "braft/raft.h"
@@ -1653,6 +1654,9 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         options.connection_type = brpc::CONNECTION_TYPE_SINGLE;
         options.max_retry = 0;
         options.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+        if (g_braft_auth_getter) {
+            options.auth = g_braft_auth_getter();
+        }
         brpc::Channel channel;
         if (0 != channel.Init(iter->addr, &options)) {
             LOG(WARNING) << "node " << _group_id << ":" << _server_id
@@ -1759,6 +1763,9 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
         options.connection_type = brpc::CONNECTION_TYPE_SINGLE;
         options.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
         options.max_retry = 0;
+        if (g_braft_auth_getter) {
+            options.auth = g_braft_auth_getter();
+        }
         brpc::Channel channel;
         if (0 != channel.Init(iter->addr, &options)) {
             LOG(WARNING) << "node " << _group_id << ":" << _server_id
