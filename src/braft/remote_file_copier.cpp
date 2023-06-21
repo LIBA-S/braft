@@ -25,6 +25,7 @@
 #include <butil/file_util.h>
 #include <bthread/bthread.h>
 #include <brpc/controller.h>
+#include "braft/auth.h"
 #include "braft/util.h"
 #include "braft/snapshot.h"
 
@@ -64,6 +65,10 @@ int RemoteFileCopier::init(const std::string& uri, FileSystemAdaptor* fs,
         LOG(ERROR) << "Invalid reader_id_format=" << uri_str
                    << " in " << uri;
         return -1;
+    }
+    brpc::ChannelOptions opt;
+    if (g_braft_auth_getter) {
+        opt.auth = g_braft_auth_getter();
     }
     if (_channel.Init(ip_and_port.as_string().c_str(), NULL) != 0) {
         LOG(ERROR) << "Fail to init Channel to " << ip_and_port;
