@@ -70,7 +70,7 @@ int RemoteFileCopier::init(const std::string& uri, FileSystemAdaptor* fs,
     if (g_braft_auth_getter) {
         opt.auth = g_braft_auth_getter();
     }
-    if (_channel.Init(ip_and_port.as_string().c_str(), NULL) != 0) {
+    if (_channel.Init(ip_and_port.as_string().c_str(), &opt) != 0) {
         LOG(ERROR) << "Fail to init Channel to " << ip_and_port;
         return -1;
     }
