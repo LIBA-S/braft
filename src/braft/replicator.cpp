@@ -1314,6 +1314,7 @@ void Replicator::_describe(std::ostream& os, bool use_html) {
 
 void Replicator::_get_status(PeerStatus* status) {
     status->valid = true;
+    status->is_witness = is_witness();
     status->installing_snapshot = (_st.st == INSTALLING_SNAPSHOT);
     status->blocking = (_st.st == BLOCKING);
     status->next_index = _next_index;

@@ -2852,6 +2852,7 @@ void NodeImpl::get_status(NodeStatus* status) {
     status->term = _current_term;
     status->peer_id = _server_id;
     status->readonly = (_node_readonly || _majority_nodes_readonly);
+    status->is_witness = is_witness();
     _conf.conf.list_peers(&peers);
     _replicator_group.list_replicators(&replicators);
 
