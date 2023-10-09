@@ -358,12 +358,13 @@ inline std::ostream& operator<<(std::ostream& os, const UserLog& user_log) {
 // Status of a peer
 struct PeerStatus {
     PeerStatus()
-        : valid(false), installing_snapshot(false), blocking(false), next_index(0)
+        : valid(false), is_witness(false), installing_snapshot(false), blocking(false), next_index(0)
         , last_rpc_send_timestamp(0), flying_append_entries_size(0)
         , readonly_index(0), consecutive_error_times(0)
     {}
 
     bool    valid;
+    bool    is_witness;
     bool    installing_snapshot;
     bool    blocking;
     int64_t next_index;
@@ -378,7 +379,7 @@ struct NodeStatus {
     typedef std::map<PeerId, PeerStatus> PeerStatusMap;
 
     NodeStatus()
-        : state(STATE_END), readonly(false), term(0), committed_index(0), known_applied_index(0)
+        : state(STATE_END), is_witness(false), readonly(false), term(0), committed_index(0), known_applied_index(0)
         , pending_index(0), pending_queue_size(0), applying_index(0), first_index(0)
         , last_index(-1), disk_index(0)
     {}
@@ -386,6 +387,7 @@ struct NodeStatus {
     State state;
     PeerId peer_id;
     PeerId leader_id;
+    bool is_witness;
     bool readonly;
     int64_t term;
     int64_t committed_index;
