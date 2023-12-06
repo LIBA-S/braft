@@ -219,6 +219,9 @@ private:
     bool is_witness() const {
         return _options.peer_id.is_witness();
     }
+    bool is_learner() const {
+        return _options.peer_id.is_learner();
+    }
     void _close_reader();
     int64_t _last_rpc_send_timestamp() {
         return _options.replicator_status->last_rpc_send_timestamp.load(butil::memory_order_relaxed);
