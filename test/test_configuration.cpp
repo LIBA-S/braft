@@ -52,7 +52,12 @@ TEST_F(TestUsageSuits, PeerId) {
     LOG(INFO) << "id:" << id1;
     ASSERT_TRUE(id1.is_witness());
 
-    ASSERT_EQ(-1, id1.parse("1.1.1.1:1000:0:2"));
+    ASSERT_EQ(0, id1.parse("1.1.1.1:1000:0:2"));
+    LOG(INFO) << "id:" << id1.to_string();
+    LOG(INFO) << "id:" << id1;
+    ASSERT_TRUE(id1.is_learner());
+
+    ASSERT_EQ(-1, id1.parse("1.1.1.1:1000:0:3"));
 
     ASSERT_EQ(0, id1.parse("1.1.1.1:1000"));
     LOG(INFO) << "id:" << id1.to_string();
@@ -75,7 +80,11 @@ TEST_F(TestUsageSuits, Configuration) {
     conf1 = peers;
     LOG(INFO) << conf1;
 
-    ASSERT_TRUE(conf1.contains(braft::PeerId("1.1.1.1:1000:0")));
+    bool role_changed = false;
+    ASSERT_TRUE(conf1.contains(braft::PeerId("1.1.1.1:1000:0"), &role_changed) && !role_changed);
+    ASSERT_TRUE(conf1.contains(braft::PeerId("1.1.1.1:1000:0:0"), &role_changed) && !role_changed);
+    ASSERT_TRUE(conf1.contains(braft::PeerId("1.1.1.1:1000:0:1"), &role_changed) && role_changed);
+    ASSERT_TRUE(conf1.contains(braft::PeerId("1.1.1.1:1000:0:2"), &role_changed) && role_changed);
     ASSERT_FALSE(conf1.contains(braft::PeerId("1.1.1.1:2000:0")));
 
     std::vector<braft::PeerId> peers2;
@@ -140,5 +149,4 @@ TEST_F(TestUsageSuits, ConfigurationManager) {
 
     conf_manager.truncate_prefix(25);
     ASSERT_EQ(braft::LogId(0, 0), conf_manager.last_configuration().id);
-
 }

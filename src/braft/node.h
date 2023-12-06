@@ -240,7 +240,8 @@ public:
     int bootstrap(const BootstrapOptions& options);
 
     bool disable_cli() const { return _options.disable_cli; }
-    bool is_witness() const { return _options.witness; }
+    bool is_witness() const { return _options.role == WITNESS; }
+    bool is_learner() const { return _options.role == LEARNER; }
 private:
 friend class butil::RefCountedThreadSafe<NodeImpl>;
 
@@ -250,6 +251,8 @@ friend class butil::RefCountedThreadSafe<NodeImpl>;
     int init_log_storage();
     int init_meta_storage();
     int init_fsm_caller(const LogId& bootstrap_index);
+    bool validate_configuration(const Configuration& old_conf,
+                                const Configuration& new_conf);
     void unsafe_register_conf_change(const Configuration& old_conf,
                                      const Configuration& new_conf,
                                      Closure* done);
