@@ -358,12 +358,13 @@ inline std::ostream& operator<<(std::ostream& os, const UserLog& user_log) {
 // Status of a peer
 struct PeerStatus {
     PeerStatus()
-        : valid(false), installing_snapshot(false), next_index(0)
+        : valid(false), is_learner(false), installing_snapshot(false), next_index(0)
         , last_rpc_send_timestamp(0), flying_append_entries_size(0)
         , readonly_index(0), consecutive_error_times(0)
     {}
 
     bool    valid;
+    bool    is_learner;
     bool    installing_snapshot;
     int64_t next_index;
     int64_t last_rpc_send_timestamp;
@@ -377,7 +378,7 @@ struct NodeStatus {
     typedef std::map<PeerId, PeerStatus> PeerStatusMap;
 
     NodeStatus()
-        : state(STATE_END), readonly(false), term(0), committed_index(0), known_applied_index(0)
+        : state(STATE_END), is_learner(false), readonly(false), term(0), committed_index(0), known_applied_index(0)
         , pending_index(0), pending_queue_size(0), applying_index(0), first_index(0)
         , last_index(-1), disk_index(0)
     {}
@@ -385,6 +386,7 @@ struct NodeStatus {
     State state;
     PeerId peer_id;
     PeerId leader_id;
+    bool is_learner;
     bool readonly;
     int64_t term;
     int64_t committed_index;
@@ -588,6 +590,11 @@ struct NodeOptions {
     // Default: false
     bool disable_cli;
 
+    // If LEARNER, this node is a learner.
+    // It will never be elected as leader. So we don't need to init _vote_timer and _election_timer.
+    //
+    // Default: REPLICA
+    Role role = REPLICA;
     // Construct a default instance
     NodeOptions();
 

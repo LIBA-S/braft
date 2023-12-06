@@ -39,7 +39,7 @@ protected:
     void SetUp() {
         g_dont_print_apply_log = false;
         //logging::FLAGS_v = 90;
-        GFLAGS_NS::SetCommandLineOption("minloglevel", "1");
+        GFLAGS_NS::SetCommandLineOption("minloglevel", "0");
         GFLAGS_NS::SetCommandLineOption("crash_on_fatal_log", "true");
         if (GetParam() == std::string("NoReplication")) {
             braft::FLAGS_raft_max_parallel_append_entries_rpc_num = 1;
@@ -495,7 +495,7 @@ TEST_P(NodeTest, JoinNode) {
 
     cond.reset(1);
     // retry add_peer direct ok
-    leader->add_peer(peer2, NEW_ADDPEERCLOSURE(&cond, 0));
+    leader->add_peer(peer2, NEW_ADDPEERCLOSURE(&cond, EINVAL));
     cond.wait();
 
     cluster.ensure_same();
@@ -723,6 +723,282 @@ TEST_P(NodeTest, Report_error_during_install_snapshot) {
     cluster.stop_all();
 }
 
+TEST_P(NodeTest, AddLearner) {
+    std::vector<braft::PeerId> peers;
+    braft::PeerId replica_peer;
+    replica_peer.addr.ip = butil::my_ip();
+    replica_peer.addr.port = 5006;
+    replica_peer.idx = 0;
+    replica_peer.role = braft::Role::REPLICA;
+    peers.push_back(replica_peer);
+
+    // start cluster
+    Cluster cluster("unittest", peers);
+    for (size_t i = 0; i < peers.size(); i++) {
+        ASSERT_EQ(0, cluster.start(peers[i].addr, false, 30, NULL, peers[i].role));
+    }
+
+    cluster.wait_leader();
+    braft::Node* leader = cluster.leader();
+    ASSERT_TRUE(leader != NULL);
+    LOG(WARNING) << "leader is " << leader->node_id();
+
+    bthread::CountdownEvent cond(10);
+    // apply something
+    for (int i = 0; i < 10; i++) {
+        butil::IOBuf data;
+        char data_buf[128];
+        snprintf(data_buf, sizeof(data_buf), "hello: %d", i + 1);
+        data.append(data_buf);
+
+        braft::Task task;
+        task.data = &data;
+        task.done = NEW_APPLYCLOSURE(&cond, 0);
+        leader->apply(task);
+    }
+    cond.wait();
+
+    // Add learner nodes
+    std::vector<braft::PeerId> learner_peers;
+    for (int i = 0; i < 3; i++) {
+        braft::PeerId peer;
+        peer.addr.ip = butil::my_ip();
+        peer.addr.port = replica_peer.addr.port + 1 + i;
+        peer.idx = 0;
+        peer.role = braft::Role::LEARNER;
+
+        learner_peers.push_back(peer);
+    }
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        cond.reset(1);
+        ASSERT_EQ(0, cluster.start(learner_peers[i].addr, false, 30, NULL, learner_peers[i].role));
+        leader->add_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, 0));
+        cond.wait();
+    }
+    cluster.ensure_same();
+
+    // Stop replica node
+    LOG(WARNING) << "stop replica " << replica_peer.addr;
+    cluster.stop(replica_peer.addr);
+
+    ASSERT_FALSE(cluster.wait_leader(10));
+
+    LOG(WARNING) << "cluster stop";
+    cluster.stop_all();
+}
+
+TEST_P(NodeTest, ChangeLearner) {
+    std::vector<braft::PeerId> peers;
+    braft::PeerId replica_peer;
+    replica_peer.addr.ip = butil::my_ip();
+    replica_peer.addr.port = 5006;
+    replica_peer.idx = 0;
+    replica_peer.role = braft::Role::REPLICA;
+    peers.push_back(replica_peer);
+
+    // start cluster
+    Cluster cluster("unittest", peers);
+    for (size_t i = 0; i < peers.size(); i++) {
+        ASSERT_EQ(0, cluster.start(peers[i].addr, false, 30, NULL, peers[i].role));
+    }
+
+    cluster.wait_leader();
+    braft::Node* leader = cluster.leader();
+    ASSERT_TRUE(leader != NULL);
+    LOG(WARNING) << "leader is " << leader->node_id();
+
+    bthread::CountdownEvent cond(10);
+    // apply something
+    for (int i = 0; i < 10; i++) {
+        butil::IOBuf data;
+        char data_buf[128];
+        snprintf(data_buf, sizeof(data_buf), "hello: %d", i + 1);
+        data.append(data_buf);
+
+        braft::Task task;
+        task.data = &data;
+        task.done = NEW_APPLYCLOSURE(&cond, 0);
+        leader->apply(task);
+    }
+    cond.wait();
+
+    // Add learner nodes
+    std::vector<braft::PeerId> learner_peers;
+    for (int i = 0; i < 3; i++) {
+        braft::PeerId peer;
+        peer.addr.ip = butil::my_ip();
+        peer.addr.port = replica_peer.addr.port + 1 + i;
+        peer.idx = 0;
+        peer.role = braft::Role::LEARNER;
+
+        learner_peers.push_back(peer);
+        peers.push_back(peer);
+    }
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        LOG(WARNING) << "Add learner " << learner_peers[i].to_string();
+        cond.reset(1);
+        ASSERT_EQ(0, cluster.start(learner_peers[i].addr, false, 30, NULL, learner_peers[i].role));
+        leader->add_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, 0));
+        cond.wait();
+    }
+    cluster.ensure_same();
+
+    // Add duplicate learner
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        LOG(WARNING) << "Add duplicate learner " << learner_peers[i].to_string();
+        cond.reset(1);
+        leader->add_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, EINVAL));
+        cond.wait();
+    }
+
+    // Promote learner
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        LOG(WARNING) << "Promote learner " << learner_peers[i].to_string();
+        braft::PeerId promote_peer(learner_peers[i]);
+        promote_peer.role = braft::Role::REPLICA;
+
+        braft::Configuration new_conf(peers);
+        new_conf.remove_peer(learner_peers[i]);
+        new_conf.add_peer(promote_peer);
+
+        cond.reset(1);
+        leader->change_peers(new_conf, NEW_ADDPEERCLOSURE(&cond, EINVAL));
+        cond.wait();
+    }
+
+    // Reset learner
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        LOG(WARNING) << "Reset learner " << learner_peers[i].to_string();
+        braft::PeerId reset_peer(learner_peers[i]);
+        reset_peer.role = braft::Role::REPLICA;
+
+        braft::Configuration new_conf(peers);
+        new_conf.remove_peer(learner_peers[i]);
+        new_conf.add_peer(reset_peer);
+
+        ASSERT_FALSE(leader->reset_peers(new_conf).ok());
+    }
+
+    // Re-Add learner
+    for (size_t i = 0; i < learner_peers.size(); i++) {
+        LOG(WARNING) << "Re-Add learner " << learner_peers[i].to_string();
+        cond.reset(1);
+        leader->remove_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, 0));
+        cluster.stop(learner_peers[i].addr);
+        cond.wait();
+
+        cond.reset(1);
+        leader->add_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, 0));
+        ASSERT_EQ(0, cluster.start(learner_peers[i].addr, false, 30, NULL, learner_peers[i].role));
+        cond.wait();
+
+        cond.reset(1);
+        leader->remove_peer(learner_peers[i], NEW_ADDPEERCLOSURE(&cond, 0));
+        cluster.stop(learner_peers[i].addr);
+        cond.wait();
+
+        braft::PeerId as_replica(learner_peers[i]);
+        as_replica.role = braft::Role::REPLICA;
+        cond.reset(1);
+        leader->add_peer(as_replica, NEW_ADDPEERCLOSURE(&cond, 0));
+        ASSERT_EQ(0, cluster.start(as_replica.addr, false, 30, NULL, as_replica.role));
+        cond.wait();
+    }
+
+    cluster.ensure_same();
+
+    std::vector<braft::PeerId> new_peers;
+    ASSERT_TRUE(leader->list_peers(&new_peers).ok());
+    for (std::vector<braft::PeerId>::const_iterator it = new_peers.begin(); it != new_peers.end(); ++it) {
+      ASSERT_TRUE(it->role == braft::Role::REPLICA);
+    }
+
+    // stop the old replica
+    LOG(WARNING) << "stop the replica " << replica_peer.addr;
+    cluster.stop(replica_peer.addr);
+
+    cluster.wait_leader();
+    braft::Node* new_leader = cluster.leader();
+    ASSERT_TRUE(new_leader != NULL);
+    LOG(WARNING) << "leader is " << new_leader->node_id();
+
+    LOG(WARNING) << "cluster stop";
+    cluster.stop_all();
+}
+
+TEST_P(NodeTest, RemoveLearner) {
+    std::vector<braft::PeerId> peers;
+    braft::PeerId replica_peer;
+    replica_peer.addr.ip = butil::my_ip();
+    replica_peer.addr.port = 5006;
+    replica_peer.idx = 0;
+    replica_peer.role = braft::Role::REPLICA;
+    peers.push_back(replica_peer);
+
+    braft::PeerId learner_peer;
+    learner_peer.addr.ip = butil::my_ip();
+    learner_peer.addr.port = 5007;
+    learner_peer.idx = 0;
+    learner_peer.role = braft::Role::LEARNER;
+    peers.push_back(learner_peer);
+
+    // start cluster
+    Cluster cluster("unittest", peers);
+    for (size_t i = 0; i < peers.size(); i++) {
+        ASSERT_EQ(0, cluster.start(peers[i].addr, false, 30, NULL, peers[i].role));
+    }
+
+    cluster.wait_leader();
+    braft::Node* leader = cluster.leader();
+    ASSERT_TRUE(leader != NULL);
+    LOG(WARNING) << "leader is " << leader->node_id();
+
+    std::vector<braft::Node*> nodes;
+    cluster.followers(&nodes);
+    ASSERT_EQ(1, nodes.size());
+    ASSERT_EQ(nodes[0]->node_id().peer_id, learner_peer);
+    LOG(WARNING) << "follower is " << nodes[0]->node_id().peer_id;
+
+    bthread::CountdownEvent cond(10);
+    // apply something
+    for (int i = 0; i < 10; i++) {
+        butil::IOBuf data;
+        char data_buf[128];
+        snprintf(data_buf, sizeof(data_buf), "hello: %d", i + 1);
+        data.append(data_buf);
+
+        braft::Task task;
+        task.data = &data;
+        task.done = NEW_APPLYCLOSURE(&cond, 0);
+        leader->apply(task);
+    }
+    cond.wait();
+
+    cluster.ensure_same();
+
+    // stop learner
+    LOG(WARNING) << "stop and clean learner " << learner_peer.addr;
+    cluster.stop(learner_peer.addr);
+    cluster.clean(learner_peer.addr);
+
+    // remove learner
+    LOG(WARNING) << "remove learner " << learner_peer.addr;
+    cond.reset(1);
+    leader->remove_peer(learner_peer, NEW_REMOVEPEERCLOSURE(&cond, 0));
+    cond.wait();
+
+    bthread_usleep(5000*1000);
+
+    cluster.wait_leader();
+    braft::Node* leader_2 = cluster.leader();
+    ASSERT_TRUE(leader_2 != NULL);
+    ASSERT_EQ(leader->node_id().peer_id, leader_2->node_id().peer_id);
+    LOG(WARNING) << "leader is " << leader_2->node_id();
+
+    LOG(WARNING) << "cluster stop";
+    cluster.stop_all();
+}
+
 TEST_P(NodeTest, RemoveFollower) {
     std::vector<braft::PeerId> peers;
     for (int i = 0; i < 3; i++) {
@@ -768,6 +1044,19 @@ TEST_P(NodeTest, RemoveFollower) {
 
     const braft::PeerId follower_id = nodes[0]->node_id().peer_id;
     const butil::EndPoint follower_addr = follower_id.addr;
+
+    // demote follower
+    LOG(WARNING) << "demote follower " << follower_addr;
+    braft::PeerId demote_peer(follower_id);
+    demote_peer.role = braft::Role::LEARNER;
+
+    braft::Configuration new_conf(peers);
+    new_conf.remove_peer(follower_id);
+    new_conf.add_peer(demote_peer);
+    cond.reset(1);
+    leader->change_peers(new_conf, NEW_ADDPEERCLOSURE(&cond, EINVAL));
+    cond.wait();
+
     // stop follower
     LOG(WARNING) << "stop and clean follower " << follower_addr;
     cluster.stop(follower_addr);
@@ -1258,7 +1547,7 @@ TEST_P(NodeTest, SetPeer2) {
     new_peers.push_back(braft::PeerId(leader_addr, 0));
 
     // new peers equal current conf
-    ASSERT_TRUE(leader->reset_peers(braft::Configuration(peers)).ok());
+    ASSERT_FALSE(leader->reset_peers(braft::Configuration(peers)).ok());
     // set peer when quorum die
     LOG(WARNING) << "set peer to " << leader_addr;
     new_peers.clear();
@@ -2787,10 +3076,20 @@ static void* change_routine(void* arg) {
             // Bad luck here
             continue;
         }
+
+        std::vector<braft::PeerId> current_peers;
+        butil::Status status = leader->list_peers(&current_peers);
+        CHECK(status.ok());
+        braft::Configuration old_conf(current_peers);
+
         braft::SynchronizedClosure done;
         leader->change_peers(conf, &done);
         done.wait();
-        CHECK(done.status().ok());
+        if (old_conf.equals(conf)) {
+            CHECK(!done.status().ok());
+        } else {
+            CHECK(done.status().ok());
+        }
     }
     return NULL;
 }
