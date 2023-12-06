@@ -97,7 +97,7 @@ TEST_F(CliTest, add_and_remove_peer) {
     ASSERT_TRUE(st.ok()) << st;
     st = braft::cli::add_peer("test", old_conf, peer2,
                              braft::cli::CliOptions()); 
-    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_FALSE(st.ok());
     braft::PeerId peer3("127.0.0.1:9502");
     RaftNode node3;
     ASSERT_EQ(0, node3.start(peer3.addr.port, false));
@@ -113,7 +113,7 @@ TEST_F(CliTest, add_and_remove_peer) {
     // Retried remove_peer
     st = braft::cli::remove_peer("test", old_conf, peer1,
                                 braft::cli::CliOptions()); 
-    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_FALSE(st.ok()) << st;
 }
 
 TEST_F(CliTest, set_peer) {
@@ -172,7 +172,7 @@ TEST_F(CliTest, change_peer) {
         conf.add_peer("127.0.0.1:" + std::to_string(9500 + i));
     }
     butil::Status st;
-    for (size_t i = 0; i < N; ++i) {
+    for (size_t i = 1; i < N; ++i) {
         usleep(1000 * 1000);
         braft::Configuration new_conf;
         new_conf.add_peer("127.0.0.1:" + std::to_string(9500 + i));

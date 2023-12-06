@@ -258,7 +258,7 @@ int NodeImpl::init_snapshot_storage() {
     opt.filter_before_copy_remote = _options.filter_before_copy_remote;
     opt.usercode_in_pthread = _options.usercode_in_pthread;
     // not need to copy data file when it is witness.
-    if (_options.witness) {
+    if (_options.role == WITNESS) {
         opt.copy_file = false;
     }
     if (_options.snapshot_file_system_adaptor) {
@@ -506,7 +506,7 @@ int NodeImpl::init(const NodeOptions& options) {
                    << ", did you forget to call braft::add_service()?";
         return -1;
     }
-    if (options.witness) {
+    if (options.role == WITNESS) {
         // When this node is a witness, set the election_timeout to be twice 
         // of the normal replica to ensure that the normal replica has a higher
         // priority and is selected as the master
@@ -514,12 +514,12 @@ int NodeImpl::init(const NodeOptions& options) {
             CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms * 2));
             CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms * 2 + options.max_clock_drift_ms));
         }
-    } else {
+    } else if (options.role == REPLICA) {
         CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
         CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
     }
-    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
     CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
+    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
 
     _config_manager = new ConfigurationManager();
 
@@ -541,7 +541,7 @@ int NodeImpl::init(const NodeOptions& options) {
     _fsm_caller = new FSMCaller();
 
     _leader_lease.init(options.election_timeout_ms);
-    if (options.witness) {
+    if (options.role == WITNESS) {
         _follower_lease.init(options.election_timeout_ms * 2, options.max_clock_drift_ms);
     } else {
         _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
@@ -792,25 +792,25 @@ void NodeImpl::on_caughtup(const PeerId& peer, int64_t term,
     _conf_ctx.on_caughtup(version, peer, false);
 }
 
-void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
-    std::vector<PeerId> peers;
-    conf.list_peers(&peers);
+void NodeImpl::check_dead_voters(const Configuration& conf, int64_t now_ms) {
+    std::vector<PeerId> voters;
+    conf.list_peers(&voters);
     size_t alive_count = 0;
     Configuration dead_nodes;  // for easily print
-    for (size_t i = 0; i < peers.size(); i++) {
-        if (peers[i] == _server_id) {
+    for (size_t i = 0; i < voters.size(); i++) {
+        if (voters[i] == _server_id) {
             ++alive_count;
             continue;
         }
 
-        if (now_ms - _replicator_group.last_rpc_send_timestamp(peers[i])
+        if (now_ms - _replicator_group.last_rpc_send_timestamp(voters[i])
                 <= _options.election_timeout_ms) {
             ++alive_count;
             continue;
         }
-        dead_nodes.add_peer(peers[i]);
+        dead_nodes.add_peer(voters[i]);
     }
-    if (alive_count >= peers.size() / 2 + 1) {
+    if (alive_count >= voters.size() / 2 + 1) {
         return;
     }
     LOG(WARNING) << "node " << node_id()
@@ -835,9 +835,9 @@ void NodeImpl::handle_stepdown_timeout() {
     }
     check_witness(_conf.conf);
     int64_t now = butil::monotonic_time_ms();
-    check_dead_nodes(_conf.conf, now);
+    check_dead_voters(_conf.conf, now);
     if (!_conf.old_conf.empty()) {
-        check_dead_nodes(_conf.old_conf, now);
+        check_dead_voters(_conf.old_conf, now);
     }
 }
 
@@ -851,6 +851,27 @@ void NodeImpl::check_witness(const Configuration& conf) {
         status.set_error(ETRANSFERLEADERSHIP, "Witness becomes leader temporarily");
         step_down(_current_term, true, status);
     }
+}
+
+bool NodeImpl::validate_configuration(const Configuration& old_conf,
+                                      const Configuration& new_conf) {
+    // The configuration change is illegal in the following two cases:
+    //
+    // 1. Attempting to change the role of an existing node. For example, trying to promote
+    //    a learner node to a WITNESS/REPLICA node or vice versa.
+    // 2. The new_conf is equal to the old_conf.
+    size_t add_node_cnt = 0;
+    for (Configuration::const_iterator new_iter = new_conf.begin(); new_iter != new_conf.end(); ++new_iter) {
+        Configuration::const_iterator old_iter = old_conf.find_peer(*new_iter);
+        if (old_iter == old_conf.end()) {
+            add_node_cnt++;
+        } else if (new_iter->role != old_iter->role) {
+            LOG(WARNING) << "Cannot change the role of peer "<< butil::endpoint2str(old_iter->addr)
+                         << " from " << int(old_iter->role) << " to " << int(new_iter->role);
+            return false;
+        }
+    }
+    return add_node_cnt != 0 || old_conf.size() != new_conf.size();
 }
 
 void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
@@ -882,8 +903,10 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
         return;
     }
 
-    // Return immediately when the new peers equals to current configuration
-    if (_conf.conf.equals(new_conf)) {
+    if (!validate_configuration(_conf.conf, new_conf)) {
+        if (done) {
+            done->status().set_error(EINVAL, "Configuration is invalidation");
+        }
         run_closure_in_bthread(done);
         return;
     }
@@ -950,9 +973,10 @@ butil::Status NodeImpl::reset_peers(const Configuration& new_peers) {
         return butil::Status(EBUSY, "Changing to another configuration");
     }
 
-    // check equal, maybe retry direct return
-    if (_conf.conf.equals(new_peers)) {
-        return butil::Status::OK();
+    if (!validate_configuration(_conf.conf, new_peers)) {
+        LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                     << " reset_peer with bad configuration";
+        return butil::Status(EINVAL, "Configuration is invalidation");
     }
 
     Configuration new_conf(new_peers);
@@ -1222,17 +1246,30 @@ int NodeImpl::transfer_leadership_to(const PeerId& peer) {
         if (_replicator_group.find_the_next_candidate(&peer_id, _conf) != 0) {
             return -1;    
         }
-    }
-    if (peer_id == _server_id) {
+    } else if (peer_id == _server_id) {
         LOG(INFO) << "node " << _group_id << ":" << _server_id  
                   << " transfering leadership to self";
         return 0;
-    }
-    if (!_conf.contains(peer_id)) {
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " refused to transfer leadership to peer " << peer_id
-                     << " which doesn't belong to " << _conf.conf;
-        return EINVAL;
+    } else {
+        bool found = false;
+        for (Configuration::const_iterator iter = _conf.conf.begin(); iter != _conf.conf.end(); ++iter) {
+              if (*iter == peer_id) {
+                  if (iter->is_learner()) {
+                      LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                                   << " refused to transfer leadership to peer " << peer_id
+                                   << " which is a learner.";
+                      return EINVAL;
+                  }
+                  found = true;
+                  break;
+              }
+        }
+        if (!found) {
+            LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                         << " refused to transfer leadership to peer " << peer_id
+                         << " which doesn't belong to " << _conf.conf;
+            return EINVAL;
+        }
     }
     const int64_t last_log_index = _log_manager->last_log_index();
     const int rc = _replicator_group.transfer_leadership_to(peer_id, last_log_index);
@@ -1335,7 +1372,7 @@ void NodeImpl::unsafe_reset_election_timeout_ms(int election_timeout_ms,
     _replicator_group.reset_heartbeat_interval(
             heartbeat_timeout(_options.election_timeout_ms));
     _replicator_group.reset_election_timeout_interval(_options.election_timeout_ms);
-    if (_options.witness && FLAGS_raft_enable_witness_to_leader) {
+    if (_options.role == WITNESS && FLAGS_raft_enable_witness_to_leader) {
         _election_timer.reset(election_timeout_ms * 2);
         _follower_lease.reset_election_timeout_ms(election_timeout_ms * 2, _options.max_clock_drift_ms);
     } else {
@@ -3629,19 +3666,19 @@ struct LastActiveTimestampCompare {
 };
 
 int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
-    std::vector<PeerId> peers;
-    conf.list_peers(&peers);
+    std::vector<PeerId> voters;
+    conf.list_voters(&voters);
     std::vector<int64_t> last_rpc_send_timestamps;
     LastActiveTimestampCompare compare;
-    for (size_t i = 0; i < peers.size(); i++) {
-        if (peers[i] == _server_id) {
+    for (size_t i = 0; i < voters.size(); i++) {
+        if (voters[i] == _server_id) {
             continue;
         }
 
-        int64_t timestamp = _replicator_group.last_rpc_send_timestamp(peers[i]);
+        int64_t timestamp = _replicator_group.last_rpc_send_timestamp(voters[i]);
         last_rpc_send_timestamps.push_back(timestamp);
         std::push_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
-        if (last_rpc_send_timestamps.size() > peers.size() / 2) {
+        if (last_rpc_send_timestamps.size() > voters.size() / 2) {
             std::pop_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
             last_rpc_send_timestamps.pop_back();
         }

@@ -246,7 +246,7 @@ public:
 
     int start(const butil::EndPoint& listen_addr, bool empty_peers = false,
               int snapshot_interval_s = 30,
-              braft::Closure* leader_start_closure = NULL, bool witness = false) {
+              braft::Closure* leader_start_closure = NULL, braft::Role role = braft::Role::REPLICA) {
         if (_server_map[listen_addr] == NULL) {
             brpc::Server* server = new brpc::Server();
             if (braft::add_service(server, listen_addr) != 0 
@@ -259,14 +259,14 @@ public:
         }
 
         braft::NodeOptions options;
-        options.witness = witness;
+        options.role = role;
         options.election_timeout_ms = _election_timeout_ms;
         options.max_clock_drift_ms = _max_clock_drift_ms;
         options.snapshot_interval_s = snapshot_interval_s;
         if (!empty_peers) {
             options.initial_conf = braft::Configuration(_peers);
         }
-        MockFSM* fsm = new MockFSM(listen_addr, witness);
+        MockFSM* fsm = new MockFSM(listen_addr, role == braft::Role::WITNESS);
         if (leader_start_closure) {
             fsm->set_on_leader_start_closure(leader_start_closure);
         }
@@ -284,14 +284,14 @@ public:
 
         options.catchup_margin = 2;
         
-        braft::Node* node = new braft::Node(_name, braft::PeerId(listen_addr, 0, witness));
+        braft::Node* node = new braft::Node(_name, braft::PeerId(listen_addr, 0, role));
         int ret = node->init(options);
         if (ret != 0) {
             LOG(WARNING) << "init_node failed, server: " << listen_addr;
             delete node;
             return ret;
         } else {
-            LOG(INFO) << "init node " << listen_addr << " witness " << witness;;
+            LOG(INFO) << "init node " << listen_addr << " role " << int(role);
         }
 
         {
@@ -383,15 +383,21 @@ public:
         return NULL;
     }
     
-    void wait_leader() {
+    bool wait_leader(int64_t wait_timeout_s = -1) {
+        int64_t nround = 0;
         while (true) {
             braft::Node* node = leader();
             if (node) {
-                return;
+                return true;
             } else {
                 usleep(100 * 1000);
+                nround++;
+            }
+            if (wait_timeout_s > 0 && (nround/10 > wait_timeout_s)) {
+                break;
             }
         }
+        return false;
     }
 
     void check_node_status() {

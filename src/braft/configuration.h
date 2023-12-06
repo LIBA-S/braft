@@ -37,6 +37,7 @@ typedef std::string VersionedGroupId;
 enum Role {
     REPLICA = 0,
     WITNESS = 1,
+    LEARNER = 2,
 };
 
 // Represent a participant in a replicating group.
@@ -48,10 +49,8 @@ struct PeerId {
     PeerId() : idx(0), role(REPLICA) {}
     explicit PeerId(butil::EndPoint addr_) : addr(addr_), idx(0), role(REPLICA)  {}
     PeerId(butil::EndPoint addr_, int idx_) : addr(addr_), idx(idx_), role(REPLICA) {}
-    PeerId(butil::EndPoint addr_, int idx_, bool witness) : addr(addr_), idx(idx_) {
-        if (witness) {
-            this->role = WITNESS;
-        }    
+    PeerId(butil::EndPoint addr_, int idx_, Role role) : addr(addr_), idx(idx_) {
+      this->role = role;
     }
 
     /*intended implicit*/PeerId(const std::string& str) 
@@ -71,6 +70,9 @@ struct PeerId {
     bool is_witness() const {
         return role == WITNESS;
     }
+    bool is_learner() const {
+        return role == LEARNER;
+    }
     int parse(const std::string& str) {
         reset();
         char ip_str[64];
@@ -80,7 +82,7 @@ struct PeerId {
             return -1;
         }
         role = (Role)value;
-        if (role > WITNESS) {
+        if (role > LEARNER) {
             reset();
             return -1;
         }
@@ -210,6 +212,18 @@ public:
         }
     }
 
+    // List all voters.
+    void list_voters(std::vector<PeerId>* voters) const {
+        voters->clear();
+        voters->reserve(_peers.size());
+        std::set<PeerId>::iterator it;
+        for (it = _peers.begin(); it != _peers.end(); ++it) {
+            if (!it->is_learner()) {
+                voters->push_back(*it);
+            }
+        }
+    }
+
     void append_peers(std::set<PeerId>* peers) {
         peers->insert(_peers.begin(), _peers.end());
     }
@@ -226,9 +240,24 @@ public:
         return _peers.erase(peer);
     }
 
+    // Returns the iterator of the peer if exist.
+    const_iterator find_peer(const PeerId& peer_id) const {
+      return _peers.find(peer_id);
+    }
+
     // True if the peer exists.
     bool contains(const PeerId& peer_id) const {
-        return _peers.find(peer_id) != _peers.end();
+      return _peers.find(peer_id) != _peers.end();
+    }
+
+    // True if the peer exists.
+    bool contains(const PeerId& peer_id, bool* role_change) const {
+        std::set<PeerId>::const_iterator it = _peers.find(peer_id);
+        if (it != _peers.end()) {
+            *role_change = it->role != peer_id.role;
+            return true;
+        }
+        return false;
     }
 
     // True if ALL peers exist.
