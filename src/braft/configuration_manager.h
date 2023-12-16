@@ -45,6 +45,8 @@ struct ConfigurationEntry {
     }
     bool contains(const PeerId& peer) const
     { return conf.contains(peer) || old_conf.contains(peer); }
+    bool is_singleton() const
+    { return stable() && conf.size() == 1; }
 };
 
 // Manager the history of configuration changing

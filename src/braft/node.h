@@ -26,6 +26,7 @@
 #include <bthread/execution_queue.h>
 #include <brpc/server.h>
 #include "braft/raft.h"
+#include "braft/read_only.h"
 #include "braft/log_manager.h"
 #include "braft/ballot_box.h"
 #include "braft/storage.h"
@@ -133,6 +134,8 @@ public:
     //
     void apply(const Task& task);
 
+    butil::Status wait_linear_consistency(ReadOnlyType read_type, int64_t timeout_ms);
+
     butil::Status list_peers(std::vector<PeerId>* peers);
 
     // @Node configuration change
@@ -159,6 +162,16 @@ public:
     // handle received RequestVote
     int handle_request_vote_request(const RequestVoteRequest* request,
                      RequestVoteResponse* response);
+
+    void handle_read_index_request(brpc::Controller* controller,
+                                   const ReadIndexRequest* request,
+                                   ReadIndexResponse* response,
+                                   google::protobuf::Closure* done);
+
+    void handle_read_index_response(const ReadIndexResponse& response,
+                                    LocalReadIndexClosure* done);
+
+    void handle_heartbeat_ctx(const PeerId& peer_id, const std::string& ctx);
 
     // handle received AppendEntries
     void handle_append_entries_request(brpc::Controller* cntl,
@@ -226,6 +239,8 @@ public:
     bool is_leader_lease_valid();
     void get_leader_lease_status(LeaderLeaseStatus* status);
 
+    void wait_on_apply(LocalReadIndexClosure* closure);
+
     // Call on_error when some error happens, after this is called.
     // After this point:
     //  - This node is to step down immediately if it was the leader.
@@ -242,6 +257,7 @@ public:
     bool disable_cli() const { return _options.disable_cli; }
     bool is_witness() const { return _options.role == WITNESS; }
     bool is_learner() const { return _options.role == LEARNER; }
+    std::string last_pending_read_unique_id() const { return _read_only.last_pending_unique_id(); }
 private:
 friend class butil::RefCountedThreadSafe<NodeImpl>;
 
@@ -271,6 +287,8 @@ friend class butil::RefCountedThreadSafe<NodeImpl>;
     // otherwise, it means setting this node's leader_id to new_leader_id.
     // status gives the situation under which this method is called.
     void reset_leader_id(const PeerId& new_leader_id, const butil::Status& status);
+
+    brpc::Channel* get_leader_channel();
 
     // check weather to step_down when receiving append_entries/install_snapshot
     // requests.
@@ -536,6 +554,12 @@ private:
 
     LeaderLease _leader_lease;
     FollowerLease _follower_lease;
+
+    // for linearizable read
+    RequestIDGenerator _id_gen;
+    ReadOnly _read_only;
+    brpc::Channel* _leader_channel;
+    brpc::ChannelOptions _leader_channel_options;
 };
 
 }

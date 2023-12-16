@@ -25,6 +25,7 @@
 #include "braft/errno.pb.h"
 #include "braft/util.h"
 #include "braft/raft.h"
+#include "braft/read_only.h"
 #include "braft/node.h"
 #include "braft/log.h"
 #include "braft/raft_meta.h"
@@ -161,7 +162,8 @@ NodeImpl::NodeImpl(const GroupId& group_id, const PeerId& peer_id)
     , _append_entries_cache(NULL)
     , _append_entries_cache_version(0)
     , _node_readonly(false)
-    , _majority_nodes_readonly(false) {
+    , _majority_nodes_readonly(false)
+    , _leader_channel(NULL) {
     butil::string_printf(&_v_group_id, "%s_%d", _group_id.c_str(), _server_id.idx);
     AddRef();
     g_num_nodes << 1;
@@ -187,7 +189,8 @@ NodeImpl::NodeImpl()
     , _append_entries_cache(NULL)
     , _append_entries_cache_version(0)
     , _node_readonly(false)
-    , _majority_nodes_readonly(false) {
+    , _majority_nodes_readonly(false)
+    , _leader_channel(NULL) {
     butil::string_printf(&_v_group_id, "%s_%d", _group_id.c_str(), _server_id.idx);
     AddRef();
     g_num_nodes << 1;
@@ -239,6 +242,10 @@ NodeImpl::~NodeImpl() {
         _options.node_owns_fsm = false;
         delete _options.fsm;
         _options.fsm = NULL;
+    }
+    if (_leader_channel) {
+      delete _leader_channel;
+      _leader_channel = NULL;
     }
     g_num_nodes << -1;
 }
@@ -506,6 +513,9 @@ int NodeImpl::init(const NodeOptions& options) {
                    << ", did you forget to call braft::add_service()?";
         return -1;
     }
+
+    _id_gen.init(_server_id);
+
     if (options.role == WITNESS) {
         // When this node is a witness, set the election_timeout to be twice 
         // of the normal replica to ensure that the normal replica has a higher
@@ -704,6 +714,179 @@ void NodeImpl::apply(const Task& task) {
         entry->Release();
         return run_closure_in_bthread(task.done);
     }
+}
+
+struct OnReadIndexRPCDone : public google::protobuf::Closure {
+    OnReadIndexRPCDone(NodeImpl* node_, LocalReadIndexClosure* done_)
+        : node(node_), done(done_) {
+        node->AddRef();
+    }
+    virtual ~OnReadIndexRPCDone() {
+        node->Release();
+    }
+
+    void Run() {
+        do {
+            if (cntl.ErrorCode() != 0) {
+                LOG(WARNING) << "node " << node->node_id()
+                             << " get read index error: " << cntl.ErrorText();
+                done->status().set_error(cntl.ErrorCode(), cntl.ErrorText());
+                run_closure_in_bthread(done);
+                break;
+            }
+
+            node->handle_read_index_response(response, done);
+        } while (0);
+
+        delete this;
+    }
+
+    ReadIndexRequest request;
+    ReadIndexResponse  response;
+    brpc::Controller cntl;
+    NodeImpl* node;
+    LocalReadIndexClosure* done;
+};
+
+butil::Status NodeImpl::wait_linear_consistency(ReadOnlyType read_type, int64_t timeout_ms) {
+    butil::Status st;
+    std::string request_id = _id_gen.next();
+    LocalReadIndexClosure* local_read_closure = new LocalReadIndexClosure();
+    local_read_closure->set_unique_id(request_id);
+
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_state == STATE_LEADER) {
+        local_read_closure->set_index(_ballot_box->last_committed_index());
+        if (_conf.is_singleton()) {
+            _fsm_caller->wait_on_apply(local_read_closure);
+        } else {
+            if (read_type == READ_ONLY_TYPE_SAFE) {
+                WaitReadIndexClosure* wait_read_index_closure = new WaitReadIndexClosure(true, local_read_closure, this);
+                Ballot ballot;
+                ballot.init(_conf.conf, &_conf.old_conf);
+                _read_only.add_request(ballot, wait_read_index_closure);
+                _read_only.recv_ack(_server_id, request_id);
+                _replicator_group.broadcast_heartbeat_with_ctx(request_id);
+            } else if (read_type == READ_ONLY_TYPE_LEASE_BASED) {
+                _fsm_caller->wait_on_apply(local_read_closure);
+            }
+        }
+    } else {
+        brpc::Channel* leader_channel = get_leader_channel();
+        if (leader_channel) {
+            st.set_error(EIO, "Connect to leader failed");
+            delete local_read_closure;
+            return st;
+        }
+
+        OnReadIndexRPCDone* done = new OnReadIndexRPCDone(this, local_read_closure);
+        done->cntl.set_timeout_ms(timeout_ms);
+        done->request.set_group_id(_group_id);
+        done->request.set_server_id(_server_id.to_string());
+        done->request.set_peer_id(_leader_id.to_string());
+        done->request.set_term(_current_term);
+        done->request.set_read_only_type(read_type);
+        done->request.set_unique_id(request_id);
+
+        RaftService_Stub stub(_leader_channel);
+        stub.read_index(&done->cntl, &done->request, &done->response, done);
+    }
+    lck.unlock();
+
+    local_read_closure->wait();
+    st = local_read_closure->status();
+    delete local_read_closure;
+
+    return st;
+}
+
+void NodeImpl::handle_read_index_request(brpc::Controller* controller,
+                                         const ReadIndexRequest* request,
+                                         ReadIndexResponse* response,
+                                         google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    const int64_t saved_current_term = _current_term;
+    if (_state != STATE_LEADER) {
+        const State saved_state = _state;
+        lck.unlock();
+
+        LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                     << " is not in leader state " << "current_term "
+                     << saved_current_term
+                     << " state " << state2str(saved_state);
+        response->set_success(false);
+        response->set_term(saved_current_term);
+        return;
+    }
+
+    const int64_t saved_read_index = _ballot_box->last_committed_index();
+    if (_conf.is_singleton()) {
+        lck.unlock();
+
+        response->set_success(true);
+        response->set_term(saved_current_term);
+        response->set_read_index(saved_read_index);
+        return;
+    }
+
+    if (request->read_only_type() == READ_ONLY_TYPE_LEASE_BASED) {
+        lck.unlock();
+
+        response->set_success(true);
+        response->set_term(saved_current_term);
+        response->set_read_index(saved_read_index);
+        return;
+    } else if (request->read_only_type() == READ_ONLY_TYPE_SAFE) {
+        RemoteReadIndexClosure* read_closure = new RemoteReadIndexClosure(controller,
+                                                                          request, response,
+                                                                          done_guard.release());
+        read_closure->set_index(saved_read_index);
+        read_closure->set_unique_id(request->unique_id());
+        WaitReadIndexClosure* wait_read_index_closure = new WaitReadIndexClosure(false, read_closure, this);
+
+        Ballot ballot;
+        ballot.init(_conf.conf, &_conf.old_conf);
+        _read_only.add_request(ballot, wait_read_index_closure);
+        _read_only.recv_ack(_server_id, request->unique_id());
+        _replicator_group.broadcast_heartbeat_with_ctx(request->unique_id());
+    } else {
+        lck.unlock();
+
+        LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                     << " receive an unexpected ReadIndexRequest with read type " << request->read_only_type()
+                     << " at term " << saved_current_term;
+        response->set_success(false);
+        response->set_term(saved_current_term);
+    }
+}
+
+void NodeImpl::handle_read_index_response(const ReadIndexResponse& response,
+                                          LocalReadIndexClosure* done) {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    const int64_t saved_current_term = _current_term;
+    lck.unlock();
+
+    //if (response->term() != saved_current_term) {
+    //    LOG(WARNING) << "node " << node_id()
+    //                 << " process ReadIndexResponse "
+    //                 << " with unexpected term=" << response->term()
+    //                 << " while current_term=" << saved_current_term;
+    //    done->status().set_error(ENEWLEADER, "Term changed");
+    //    return run_closure_in_bthread(done);
+    //}
+
+    if (!response.success()) {
+        LOG(WARNING) << "node " << node_id()
+                     << " process ReadIndexResponse failed"
+                     << " at term=" << saved_current_term;
+        done->status().set_error(ENEWLEADER, "Fetch read index failed");
+        return run_closure_in_bthread(done);
+    }
+
+    done->set_index(response.read_index());
+    _fsm_caller->wait_on_apply(done);
 }
 
 void NodeImpl::on_configuration_change_done(int64_t term) {
@@ -1919,6 +2102,11 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
 // in lock
 void NodeImpl::reset_leader_id(const PeerId& new_leader_id, 
         const butil::Status& status) {
+    if (_leader_channel) {
+        delete _leader_channel;
+        _leader_channel = NULL;
+    }
+
     if (new_leader_id.is_empty()) {
         if (!_leader_id.is_empty() && _state > STATE_TRANSFERRING) {
             LeaderChangeContext stop_following_context(_leader_id, 
@@ -1935,6 +2123,24 @@ void NodeImpl::reset_leader_id(const PeerId& new_leader_id,
         }
         _leader_id = new_leader_id;
     }
+}
+
+// in lock
+brpc::Channel* NodeImpl::get_leader_channel() {
+    if (_leader_channel) {
+        return _leader_channel;
+    }
+    _leader_channel = new brpc::Channel();
+    _leader_channel_options.connection_type = brpc::CONNECTION_TYPE_SINGLE;
+    _leader_channel_options.max_retry = 0;
+    _leader_channel_options.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+    if (0 != _leader_channel->Init(_leader_id.addr, &_leader_channel_options)) {
+        LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                     << " leader channel init failed, addr " << _leader_id.addr;
+        delete _leader_channel;
+        _leader_channel = NULL;
+    }
+    return _leader_channel;
 }
 
 // in lock
@@ -2426,6 +2632,23 @@ private:
     NodeImpl* _node;
     int64_t _term;
 };
+
+void NodeImpl::handle_heartbeat_ctx(const PeerId& peer_id, const std::string& ctx) {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_read_only.recv_ack(peer_id, ctx)) {
+        ReadOnly::BallotAndClosureVec closure_vec = _read_only.advance(ctx);
+        lck.unlock();
+
+        for (ReadOnly::BallotAndClosureVec::const_iterator iter = closure_vec.begin();
+                iter != closure_vec.end(); ++iter) {
+            run_closure_in_bthread(iter->done);
+        }
+    }
+}
+
+void NodeImpl::wait_on_apply(LocalReadIndexClosure* closure) {
+    _fsm_caller->wait_on_apply(closure);
+}
 
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              const AppendEntriesRequest* request,

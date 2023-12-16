@@ -49,11 +49,30 @@ FSMCaller::FSMCaller()
     , _cur_task(IDLE)
     , _applying_index(0)
     , _queue_started(false)
+    , _next_wait_id(0)
 {
 }
 
 FSMCaller::~FSMCaller() {
     CHECK(_after_shutdown == NULL);
+}
+
+int FSMCaller::notify_apply(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
+    FSMCaller* caller = (FSMCaller*)meta;
+    if (iter.is_queue_stopped()) {
+        return 0;
+    }
+    for (; iter; ++iter) {
+        switch (iter->type) {
+        case APPLIED:
+            caller->wakeup_waiters(iter->applied_index);
+            break;
+        default:
+            CHECK(false) << "Can't reach here";
+            break;
+        };
+    }
+    return 0;
 }
 
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
@@ -124,6 +143,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
                 caller->_cur_task = ERROR;
                 caller->do_on_error((OnErrorClousre*)iter->done);
                 break;
+            case APPLIED:
             case IDLE:
                 CHECK(false) << "Can't reach here";
                 break;
@@ -170,11 +190,19 @@ int FSMCaller::init(const FSMCallerOptions &options) {
     if (_node) {
         _node->AddRef();
     }
-    
+
     bthread::ExecutionQueueOptions execq_opt;
     execq_opt.bthread_attr = options.usercode_in_pthread 
                              ? BTHREAD_ATTR_PTHREAD
                              : BTHREAD_ATTR_NORMAL;
+    if (bthread::execution_queue_start(&_apply_queue_id,
+                                   &execq_opt,
+                                   FSMCaller::notify_apply,
+                                   this) != 0) {
+        LOG(ERROR) << "fsm fail to start execution_queue for apply";
+        return -1;
+    }
+
     if (bthread::execution_queue_start(&_queue_id,
                                    &execq_opt,
                                    FSMCaller::run,
@@ -188,7 +216,8 @@ int FSMCaller::init(const FSMCallerOptions &options) {
 
 int FSMCaller::shutdown() {
     if (_queue_started) {
-        return bthread::execution_queue_stop(_queue_id);
+        return bthread::execution_queue_stop(_apply_queue_id)
+               && bthread::execution_queue_stop(_queue_id);
     }
     return 0;
 }
@@ -213,6 +242,13 @@ int FSMCaller::on_committed(int64_t committed_index) {
     t.type = COMMITTED;
     t.committed_index = committed_index;
     return bthread::execution_queue_execute(_queue_id, t);
+}
+
+int FSMCaller::on_applied(const int64_t applied_index) {
+    ApplyTask t;
+    t.type = APPLIED;
+    t.applied_index = applied_index;
+    return bthread::execution_queue_execute(_apply_queue_id, t);
 }
 
 class OnErrorClousre : public Closure {
@@ -316,6 +352,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
     _last_applied_index.store(committed_index, butil::memory_order_release);
     _last_applied_term = last_term;
     _log_manager->set_applied_id(last_applied_id);
+    on_applied(committed_index);
 }
 
 int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
@@ -545,8 +582,75 @@ int64_t FSMCaller::applying_index() const {
 
 void FSMCaller::join() {
     if (_queue_started) {
+        bthread::execution_queue_join(_apply_queue_id);
         bthread::execution_queue_join(_queue_id);
         _queue_started = false;
+    }
+}
+
+FSMCaller::WaitId FSMCaller::wait_on_apply(LocalReadIndexClosure* done) {
+    WaitId wait_id = -1;
+    int64_t last_applied_index = _last_applied_index.load(
+                                        butil::memory_order_relaxed);
+    if (last_applied_index < done->index()) {
+        BAIDU_SCOPED_LOCK(_wait_mutex);
+        if (_next_wait_id == 0) {
+            ++_next_wait_id;
+        }
+        wait_id = _next_wait_id++;
+        WaitIdAndClosure wac;
+        wac.wait_id = wait_id;
+        wac.done = done;
+
+        _id_and_closure_wait_map[wait_id] = wac;
+        _index_and_closure_wait_map[done->index()].push_back(wac);
+    } else {
+        run_closure_in_bthread(done);
+    }
+    return wait_id;
+}
+
+int FSMCaller::remove_waiter(WaitId id) {
+    WaitIdAndClosure wac;
+    {
+        BAIDU_SCOPED_LOCK(_wait_mutex);
+        WaitIdAndClosure* pwac = _id_and_closure_wait_map.seek(id);
+        if (pwac) {
+            wac = *pwac;
+            _id_and_closure_wait_map.erase(id);
+            IndexAndClosureListMap::iterator iter = _index_and_closure_wait_map.find(id);
+            if (iter == _index_and_closure_wait_map.end()) {
+                LOG(FATAL) << "unexpected wait map";
+            }
+            iter->second.remove(wac);
+        }
+    }
+    if (wac.done) {
+        wac.done->status().set_error(EIDRM, "The waiter is removed");
+        run_closure_in_bthread(wac.done);
+    }
+    return wac.done != NULL ? 0 : -1;
+}
+
+void FSMCaller::wakeup_waiters(const int64_t apply_index) {
+    WaitIdAndClosureList ready_closures;
+    {
+        BAIDU_SCOPED_LOCK(_wait_mutex);
+        for (IndexAndClosureListMap::iterator iter = _index_and_closure_wait_map.begin();
+                iter != _index_and_closure_wait_map.end();) {
+            if (iter->first > apply_index) {
+                break;
+            }
+            for (WaitIdAndClosureList::const_iterator list_iter = iter->second.begin();
+                    list_iter != iter->second.end(); ++list_iter) {
+                _id_and_closure_wait_map.erase(list_iter->wait_id);
+            }
+            ready_closures.splice(ready_closures.end(), iter->second);
+            iter = _index_and_closure_wait_map.erase(iter);
+        }
+    }
+    for (WaitIdAndClosureList::iterator iter = ready_closures.begin(); iter != ready_closures.end(); ++iter) {
+        run_closure_in_bthread(iter->done);
     }
 }
 
