@@ -244,9 +244,14 @@ public:
         stop_all();
     }
 
+    int start_with_statemachine(const butil::EndPoint& listen_addr, braft::Role role, MockFSM* state_machine) {
+        return start(listen_addr, false, 30, NULL, role, state_machine);
+    }
+
     int start(const butil::EndPoint& listen_addr, bool empty_peers = false,
               int snapshot_interval_s = 30,
-              braft::Closure* leader_start_closure = NULL, braft::Role role = braft::Role::REPLICA) {
+              braft::Closure* leader_start_closure = NULL, braft::Role role = braft::Role::REPLICA,
+              MockFSM* state_machine = NULL) {
         if (_server_map[listen_addr] == NULL) {
             brpc::Server* server = new brpc::Server();
             if (braft::add_service(server, listen_addr) != 0 
@@ -266,7 +271,7 @@ public:
         if (!empty_peers) {
             options.initial_conf = braft::Configuration(_peers);
         }
-        MockFSM* fsm = new MockFSM(listen_addr, role == braft::Role::WITNESS);
+        MockFSM* fsm = state_machine ? state_machine : (new MockFSM(listen_addr, role == braft::Role::WITNESS));
         if (leader_start_closure) {
             fsm->set_on_leader_start_closure(leader_start_closure);
         }

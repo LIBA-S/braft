@@ -19,6 +19,8 @@
 #ifndef  BRAFT_FSM_CALLER_H
 #define  BRAFT_FSM_CALLER_H
 
+#include <list>
+
 #include <butil/macros.h>                        // BAIDU_CACHELINE_ALIGNMENT
 #include <bthread/bthread.h>
 #include <bthread/execution_queue.h>
@@ -27,6 +29,7 @@
 #include "braft/macros.h"
 #include "braft/log_entry.h"
 #include "braft/lease.h"
+#include "braft/read_only.h"
 
 namespace braft {
 
@@ -105,6 +108,8 @@ public:
 
 class BAIDU_CACHELINE_ALIGNMENT FSMCaller {
 public:
+    typedef int64_t WaitId;
+
     FSMCaller();
     BRAFT_MOCK ~FSMCaller();
     int init(const FSMCallerOptions& options);
@@ -123,13 +128,17 @@ public:
     int64_t applying_index() const;
     void describe(std::ostream& os, bool use_html);
     void join();
+
+    WaitId wait_on_apply(LocalReadIndexClosure* done);
+    int remove_waiter(WaitId id);
+
 private:
 
 friend class IteratorImpl;
-
     enum TaskType {
         IDLE,
         COMMITTED,
+        APPLIED,
         SNAPSHOT_SAVE,
         SNAPSHOT_LOAD,
         LEADER_STOP,
@@ -153,6 +162,9 @@ friend class IteratorImpl;
         union {
             // For applying log entry (including configuration change)
             int64_t committed_index;
+
+            // For notification
+            int64_t applied_index;
             
             // For on_leader_start
             LeaderStartContext* leader_start_context;
@@ -169,7 +181,9 @@ friend class IteratorImpl;
     };
 
     static double get_cumulated_cpu_time(void* arg);
+    static int notify_apply(void* meta, bthread::TaskIterator<ApplyTask>& iter);
     static int run(void* meta, bthread::TaskIterator<ApplyTask>& iter);
+    int on_applied(const int64_t applied_index);
     void do_shutdown(); //Closure* done);
     void do_committed(int64_t committed_index);
     void do_cleared(int64_t log_index, Closure* done, int error_code);
@@ -182,6 +196,7 @@ friend class IteratorImpl;
     void do_stop_following(const LeaderChangeContext& stop_following_context);
     void set_error(const Error& e);
     bool pass_by_status(Closure* done);
+    void wakeup_waiters(const int64_t apply_index);
 
     bthread::ExecutionQueueId<ApplyTask> _queue_id;
     LogManager *_log_manager;
@@ -195,6 +210,21 @@ friend class IteratorImpl;
     butil::atomic<int64_t> _applying_index;
     Error _error;
     bool _queue_started;
+
+    struct WaitIdAndClosure {
+        WaitIdAndClosure() : wait_id(-1), done(NULL) {}
+
+        WaitId wait_id;
+        LocalReadIndexClosure* done;
+    };
+    typedef std::list<WaitIdAndClosure> WaitIdAndClosureList;
+    typedef std::map<int64_t, WaitIdAndClosureList> IndexAndClosureListMap;
+
+    bthread::ExecutionQueueId<ApplyTask> _apply_queue_id;
+    raft_mutex_t _wait_mutex;
+    butil::FlatMap<WaitId, WaitIdAndClosure> _id_and_closure_wait_map;
+    IndexAndClosureListMap _index_and_closure_wait_map;
+    WaitId _next_wait_id;
 };
 
 };

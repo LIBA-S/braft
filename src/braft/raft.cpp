@@ -182,6 +182,10 @@ void Node::apply(const Task& task) {
     _impl->apply(task);
 }
 
+butil::Status Node::wait_linear_consistency(ReadOnlyType read_type, int64_t timeout_ms) {
+    return _impl->wait_linear_consistency(read_type, timeout_ms);
+}
+
 butil::Status Node::list_peers(std::vector<PeerId>* peers) {
     return _impl->list_peers(peers);
 }

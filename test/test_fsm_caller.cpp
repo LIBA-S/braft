@@ -12,6 +12,10 @@
 #include "braft/configuration.h"
 #include "braft/log_manager.h"
 
+namespace braft {
+DECLARE_bool(raft_sync);
+}
+
 class FSMCallerTest : public testing::Test {
 protected:
     void SetUp() {}
@@ -62,7 +66,7 @@ public:
         }
     }
 private:
-    uint64_t _expected_next;
+    std::atomic<uint64_t> _expected_next;
     bool _stopped;
     int _on_leader_start_times;
     int _on_leader_stop_times;
@@ -141,6 +145,193 @@ TEST_F(FSMCallerTest, sanity) {
         ASSERT_TRUE(c.status().ok()) << c.status();
     }
     ASSERT_EQ(0, caller.on_committed(N));
+    ASSERT_EQ(0, caller.shutdown());
+    fsm.join();
+    ASSERT_EQ(fsm._expected_next, N);
+}
+
+class ExpectedValueLocalReadIndexClosure : public braft::LocalReadIndexClosure {
+public:
+    ExpectedValueLocalReadIndexClosure(OrderedStateMachine* state_machine)
+        : _value(0), _state_machine(state_machine) {}
+
+    void Run() {
+        _value = _state_machine->_expected_next;
+        braft::LocalReadIndexClosure::Run();
+    }
+
+    bool check_value() { return  _value >= index(); }
+
+    void set_wait_id(braft::FSMCaller::WaitId wait_id) { _wait_id = wait_id; }
+    braft::FSMCaller::WaitId wait_id() const { return _wait_id; }
+
+private:
+    int64_t _value;
+    braft::FSMCaller::WaitId _wait_id;
+    OrderedStateMachine* _state_machine;
+};
+
+struct WaitIdAndClosure {
+    WaitIdAndClosure(braft::FSMCaller::WaitId _wait_id, braft::LocalReadIndexClosure* _done)
+        : wait_id(_wait_id), done(_done) {}
+
+    braft::FSMCaller::WaitId wait_id;
+    braft::LocalReadIndexClosure* done;
+};
+
+struct WaitArg {
+    braft::FSMCaller* caller;
+    OrderedStateMachine* state_machine;
+    int64_t max_index;
+};
+
+static void* wait_routine(void* arg) {
+    const size_t N = 100000;
+    std::vector<ExpectedValueLocalReadIndexClosure*> wait_closures;
+    wait_closures.reserve(N);
+
+    WaitArg* wa = (WaitArg*)arg;
+    srand((unsigned)time(NULL));
+    for (size_t i = 0; i < N; ++i) {
+        ExpectedValueLocalReadIndexClosure* closure = new ExpectedValueLocalReadIndexClosure(wa->state_machine);
+        closure->set_index((rand()%wa->max_index) + 1);
+        wait_closures.push_back(closure);
+        closure->set_wait_id(wa->caller->wait_on_apply(closure));
+    }
+
+    LOG(ERROR) << "append closure done";
+
+    int no_wait = 0;
+    for (size_t i = 0; i < N; ++i) {
+        wait_closures[i]->wait();
+        CHECK(wait_closures[i]->check_value());
+        if (wait_closures[i]->wait_id() == -1) {
+          no_wait++;
+        }
+        delete wait_closures[i];
+        if (i % (N/10) == 0) {
+            LOG(ERROR) << "wait ready number: " << i;
+        }
+    }
+
+    LOG(ERROR) << "wait and check closure done, no wait size: " << no_wait;
+
+    return NULL;
+}
+
+TEST_F(FSMCallerTest, apply_sanity) {
+    system("rm -rf ./data");
+    scoped_ptr<braft::ConfigurationManager> cm(
+                                new braft::ConfigurationManager);
+    scoped_ptr<braft::SegmentLogStorage> storage(
+                                new braft::SegmentLogStorage("./data"));
+    scoped_ptr<braft::LogManager> lm(new braft::LogManager());
+    braft::LogManagerOptions log_opt;
+    log_opt.log_storage = storage.get();
+    log_opt.configuration_manager = cm.get();
+    ASSERT_EQ(0, lm->init(log_opt));
+
+    braft::ClosureQueue cq(false);
+
+    OrderedStateMachine fsm;
+    fsm._expected_next = 0;
+
+    braft::FSMCallerOptions opt;
+    opt.log_manager = lm.get();
+    opt.after_shutdown = NULL;
+    opt.fsm = &fsm;
+    opt.closure_queue = &cq;
+
+    braft::FSMCaller caller;
+    ASSERT_EQ(0, caller.init(opt));
+
+    const size_t N = 1000000;
+    srand((unsigned)time(NULL));
+
+    std::vector<WaitIdAndClosure> wait_closures;
+    wait_closures.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
+        braft::LocalReadIndexClosure* closure = new braft::LocalReadIndexClosure();
+        closure->set_index((rand()%10000) + 1);
+
+        braft::FSMCaller::WaitId wait_id = caller.wait_on_apply(closure);
+        ASSERT_NE(wait_id, -1);
+        wait_closures.push_back(WaitIdAndClosure(wait_id, closure));
+    }
+
+    for (size_t i = 0; i < wait_closures.size(); ++i) {
+        ASSERT_EQ(0, caller.remove_waiter(wait_closures[i].wait_id));
+        wait_closures[i].done->wait();
+        ASSERT_EQ(wait_closures[i].done->status().error_code(), EIDRM);
+        delete wait_closures[i].done;
+    }
+
+    ASSERT_EQ(0, caller.shutdown());
+    fsm.join();
+}
+
+TEST_F(FSMCallerTest, apply_waiter) {
+    braft::FLAGS_raft_sync = false;
+    system("rm -rf ./data");
+    scoped_ptr<braft::ConfigurationManager> cm(
+                                new braft::ConfigurationManager);
+    scoped_ptr<braft::SegmentLogStorage> storage(
+                                new braft::SegmentLogStorage("./data"));
+    scoped_ptr<braft::LogManager> lm(new braft::LogManager());
+    braft::LogManagerOptions log_opt;
+    log_opt.log_storage = storage.get();
+    log_opt.configuration_manager = cm.get();
+    ASSERT_EQ(0, lm->init(log_opt));
+
+    braft::ClosureQueue cq(false);
+
+    OrderedStateMachine fsm;
+    fsm._expected_next = 0;
+
+    braft::FSMCallerOptions opt;
+    opt.log_manager = lm.get();
+    opt.after_shutdown = NULL;
+    opt.fsm = &fsm;
+    opt.closure_queue = &cq;
+
+    braft::FSMCaller caller;
+    ASSERT_EQ(0, caller.init(opt));
+
+    const size_t N = 50000;
+
+    WaitArg arg;
+    arg.caller = &caller;
+    arg.state_machine = &fsm;
+    arg.max_index = N;
+    pthread_t tid;
+    ASSERT_EQ(0, pthread_create(&tid, NULL, wait_routine, &arg));
+
+    LOG(ERROR) << "start to append entries";
+
+    for (size_t i = 0; i < N; ++i) {
+        std::vector<braft::LogEntry*> entries;
+        braft::LogEntry* entry = new braft::LogEntry;
+        entry->AddRef();
+        entry->type = braft::ENTRY_TYPE_DATA;
+        std::string buf;
+        butil::string_printf(&buf, "hello_%lld", (long long)i);
+        entry->data.append(buf);
+        entry->id.index = i + 1;
+        entry->id.term = i;
+        entries.push_back(entry);
+        SyncClosure c;
+        lm->append_entries(&entries, &c);
+        c.join();
+        ASSERT_TRUE(c.status().ok()) << c.status();
+        ASSERT_EQ(0, caller.on_committed(i + 1));
+        if (i % (N/10) == 0) {
+            LOG(ERROR) << "append entries number: " << i;
+        }
+    }
+    LOG(ERROR) << "append entries done";
+
+    pthread_join(tid, NULL);
+
     ASSERT_EQ(0, caller.shutdown());
     fsm.join();
     ASSERT_EQ(fsm._expected_next, N);
