@@ -166,4 +166,30 @@ void RaftServiceImpl::timeout_now(::google::protobuf::RpcController* controller,
     node->handle_timeout_now_request(cntl, request, response, done);
 }
 
+void RaftServiceImpl::read_index(::google::protobuf::RpcController* controller,
+                                 const ::braft::ReadIndexRequest* request,
+                                 ::braft::ReadIndexResponse* response,
+                                 ::google::protobuf::Closure* done) {
+    brpc::Controller* cntl =
+        static_cast<brpc::Controller*>(controller);
+
+    PeerId peer_id;
+    if (0 != peer_id.parse(request->peer_id())) {
+        cntl->SetFailed(EINVAL, "peer_id invalid");
+        done->Run();
+        return;
+    }
+
+    scoped_refptr<NodeImpl> node_ptr =
+                        global_node_manager->get(request->group_id(), peer_id);
+    NodeImpl* node = node_ptr.get();
+    if (!node) {
+        cntl->SetFailed(ENOENT, "peer_id not exist");
+        done->Run();
+        return;
+    }
+
+    node->handle_read_index_request(cntl, request, response, done);
+}
+
 }

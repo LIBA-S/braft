@@ -332,6 +332,13 @@ void Replicator::_on_heartbeat_returned(
     r->_update_last_rpc_send_timestamp(rpc_send_time);
     r->_start_heartbeat_timer(start_time_us);
     NodeImpl* node_impl = NULL;
+    if (response->has_ctx() && !response->ctx().empty()) {
+        LOG(ERROR) << "reach heare ctx: " << response->ctx();
+        NodeImpl *node_impl = r->_options.node;
+        node_impl->AddRef();
+        node_impl->handle_heartbeat_ctx(r->_options.peer_id, response->ctx());
+        node_impl->Release();
+    }
     // Check if readonly config changed
     if ((readonly && r->_readonly_index == 0) ||
         (!readonly && r->_readonly_index != 0)) {
@@ -479,6 +486,15 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                                     << min_flying_index << ", " 
                                     << rpc_last_log_index
                                     << "] to peer " << r->_options.peer_id;
+
+    if (response->has_ctx() && !response->ctx().empty()) {
+        LOG(ERROR) << "reach heare ctx: " << response->ctx();
+        NodeImpl *node_impl = r->_options.node;
+        node_impl->AddRef();
+        node_impl->handle_heartbeat_ctx(r->_options.peer_id, response->ctx());
+        node_impl->Release();
+    }
+
     if (entries_size > 0) {
         r->_options.ballot_box->commit_at(
                 min_flying_index, rpc_last_log_index,
@@ -547,7 +563,7 @@ int Replicator::_fill_common_fields(AppendEntriesRequest* request,
     return 0;
 }
 
-void Replicator::_send_empty_entries(bool is_heartbeat) {
+void Replicator::_send_empty_entries(bool is_heartbeat, const std::string& ctx) {
     std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
     std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
     std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
@@ -556,6 +572,9 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
         CHECK(!is_heartbeat);
         // _id is unlock in _install_snapshot
         return _install_snapshot();
+    }
+    if (!ctx.empty()) {
+        request->set_ctx(ctx);
     }
     if (is_heartbeat) {
         _heartbeat_in_fly = cntl->call_id();
@@ -971,8 +990,12 @@ void* Replicator::_send_heartbeat(void* arg) {
         // This replicator is stopped
         return NULL;
     }
+    NodeImpl *node_impl = r->_options.node;
+    node_impl->AddRef();
+    std::string ctx = node_impl->last_pending_read_unique_id();
+    node_impl->Release();
     // id is unlock in _send_empty_entries;
-    r->_send_empty_entries(true);
+    r->_send_empty_entries(true, ctx);
     return NULL;
 }
 
@@ -1173,6 +1196,16 @@ int Replicator::send_timeout_now_and_stop(ReplicatorId id, int timeout_ms) {
     }
     // dummy_id is unlock in _send_timeout_now
     r->_send_timeout_now(true, true, timeout_ms);
+    return 0;
+}
+
+int Replicator::send_heartbeat_with_ctx(ReplicatorId id, const std::string& ctx) {
+    Replicator *r = NULL;
+    bthread_id_t dummy_id = { id };
+    if (bthread_id_trylock(dummy_id, (void**)&r) != 0) {
+        return -1;
+    }
+    r->_send_empty_entries(true, ctx);
     return 0;
 }
 
@@ -1431,13 +1464,23 @@ int ReplicatorGroup::stop_replicator(const PeerId &peer) {
 int ReplicatorGroup::stop_all() {
     std::vector<ReplicatorId> rids;
     rids.reserve(_rmap.size());
-    for (std::map<PeerId, ReplicatorIdAndStatus>::const_iterator 
+    for (std::map<PeerId, ReplicatorIdAndStatus>::const_iterator
             iter = _rmap.begin(); iter != _rmap.end(); ++iter) {
         rids.push_back(iter->second.id);
     }
     _rmap.clear();
     for (size_t i = 0; i < rids.size(); ++i) {
         Replicator::stop(rids[i]);
+    }
+    return 0;
+}
+
+int ReplicatorGroup::broadcast_heartbeat_with_ctx(const std::string& ctx) {
+    std::vector<ReplicatorId> rids;
+    rids.reserve(_rmap.size());
+    for (std::map<PeerId, ReplicatorIdAndStatus>::const_iterator
+            iter = _rmap.begin(); iter != _rmap.end(); ++iter) {
+        Replicator::send_heartbeat_with_ctx(iter->second.id, ctx);
     }
     return 0;
 }

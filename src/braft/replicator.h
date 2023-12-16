@@ -108,6 +108,8 @@ public:
     // finishes no matter it succes or fails.
     static int send_timeout_now_and_stop(ReplicatorId id, int timeout_ms);
 
+    static int send_heartbeat_with_ctx(ReplicatorId id, const std::string& ctx);
+
     // Get the next index of this Replica if we know the correct value is
     // Return the correct value on success, 0 otherwise.
     static int64_t get_next_index(ReplicatorId id);
@@ -152,7 +154,7 @@ private:
 
     int _prepare_entry(int offset, EntryMeta* em, butil::IOBuf* data);
     void _wait_more_entries();
-    void _send_empty_entries(bool is_heartbeat);
+    void _send_empty_entries(bool is_heartbeat, const std::string& ctx = "");
     void _send_entries();
     void _notify_on_caught_up(int error_code, bool);
     int _fill_common_fields(AppendEntriesRequest* request, int64_t prev_log_index,
@@ -304,6 +306,8 @@ public:
 
     // Stop all the replicators
     int stop_all();
+
+    int broadcast_heartbeat_with_ctx(const std::string& ctx);
 
     int stop_replicator(const PeerId &peer);
 
