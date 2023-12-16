@@ -50,6 +50,11 @@ public:
                      const ::braft::TimeoutNowRequest* request,
                      ::braft::TimeoutNowResponse* response,
                      ::google::protobuf::Closure* done);
+
+    void read_index(::google::protobuf::RpcController* controller,
+                    const ::braft::ReadIndexRequest* request,
+                    ::braft::ReadIndexResponse* response,
+                    ::google::protobuf::Closure* done);
 private:
     butil::EndPoint _addr;
 };

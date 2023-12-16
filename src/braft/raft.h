@@ -29,6 +29,7 @@
 #include "braft/configuration.h"
 #include "braft/enum.pb.h"
 #include "braft/errno.pb.h"
+#include "braft/raft.pb.h"
 
 template <typename T> class scoped_refptr;
 
@@ -690,6 +691,8 @@ public:
     //              Otherwise we will specify the error and call it.
     //
     void apply(const Task& task);
+
+    butil::Status wait_linear_consistency(ReadOnlyType read_type, int64_t timeout_ms = -1);
 
     // list peers of this raft group, only leader retruns ok
     // [NOTE] when list_peers concurrency with add_peer/remove_peer, maybe return peers is staled.

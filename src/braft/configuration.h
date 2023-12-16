@@ -224,6 +224,17 @@ public:
         }
     }
 
+    bool is_singleton() const {
+        int voter_num = 0;
+        std::set<PeerId>::iterator it;
+        for (it = _peers.begin(); it != _peers.end(); ++it) {
+            if (!it->is_learner()) {
+                voter_num++;
+            }
+        }
+        return voter_num == 1;
+    }
+
     void append_peers(std::set<PeerId>* peers) {
         peers->insert(_peers.begin(), _peers.end());
     }
