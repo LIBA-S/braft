@@ -246,6 +246,10 @@ bool Node::readonly() {
     return _impl->readonly();
 }
 
+SnapshotMeta Node::create_snapshot_meta() {
+    return _impl->create_snapshot_meta();
+}
+
 // ------------- Iterator
 void Iterator::next() {
     if (valid()) {

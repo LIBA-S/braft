@@ -258,6 +258,7 @@ public:
     bool is_witness() const { return _options.role == WITNESS; }
     bool is_learner() const { return _options.role == LEARNER; }
     std::string last_pending_read_unique_id() { return _read_only.last_pending_unique_id(); }
+    SnapshotMeta create_snapshot_meta() {return _fsm_caller->create_snapshot_meta();}
 private:
 friend class butil::RefCountedThreadSafe<NodeImpl>;
 

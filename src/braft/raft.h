@@ -802,6 +802,10 @@ public:
     //        is less than the majority.
     bool readonly();
 
+    // Create current state snapshot meta
+    // this function is help user to save custom snapshot meta but without cause log compaction
+    SnapshotMeta create_snapshot_meta();
+
 private:
     NodeImpl* _impl;
 };

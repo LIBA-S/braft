@@ -131,6 +131,7 @@ public:
 
     WaitId wait_on_apply(LocalReadIndexClosure* done);
     int remove_waiter(WaitId id);
+    SnapshotMeta create_snapshot_meta();
 
 private:
 

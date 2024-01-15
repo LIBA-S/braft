@@ -376,6 +376,28 @@ int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
     return bthread::execution_queue_execute(_queue_id, task);
 }
 
+SnapshotMeta FSMCaller::create_snapshot_meta() {
+    int64_t last_applied_index = _last_applied_index.load(butil::memory_order_relaxed);
+
+    SnapshotMeta meta;
+    meta.set_last_included_index(last_applied_index);
+    meta.set_last_included_term(_last_applied_term);
+    ConfigurationEntry conf_entry;
+    _log_manager->get_configuration(last_applied_index, &conf_entry);
+    for (Configuration::const_iterator
+            iter = conf_entry.conf.begin();
+            iter != conf_entry.conf.end(); ++iter) { 
+        *meta.add_peers() = iter->to_string();
+    }
+    for (Configuration::const_iterator
+            iter = conf_entry.old_conf.begin();
+            iter != conf_entry.old_conf.end(); ++iter) { 
+        *meta.add_old_peers() = iter->to_string();
+    }
+
+    return meta;
+}
+
 void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
     CHECK(done);
 
