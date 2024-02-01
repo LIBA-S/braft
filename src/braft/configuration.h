@@ -239,6 +239,15 @@ public:
         peers->insert(_peers.begin(), _peers.end());
     }
 
+    void append_voters(std::set<PeerId>* voters) {
+        std::set<PeerId>::iterator it;
+        for (it = _peers.begin(); it != _peers.end(); ++it) {
+            if (!it->is_learner()) {
+                voters->insert(*it);
+            }
+        }
+    }
+
     // Add a peer.
     // Returns true if the peer is newly added.
     bool add_peer(const PeerId& peer) {

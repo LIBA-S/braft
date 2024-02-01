@@ -43,6 +43,11 @@ struct ConfigurationEntry {
         conf.append_peers(peers);
         old_conf.append_peers(peers);
     }
+    void list_voters(std::set<PeerId>* voters) {
+        voters->clear();
+        conf.append_voters(voters);
+        old_conf.append_voters(voters);
+    }
     bool contains(const PeerId& peer) const
     { return conf.contains(peer) || old_conf.contains(peer); }
     bool is_singleton() const
