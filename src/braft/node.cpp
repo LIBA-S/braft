@@ -973,7 +973,7 @@ void NodeImpl::on_caughtup(const PeerId& peer, int64_t term,
 
 void NodeImpl::check_dead_voters(const Configuration& conf, int64_t now_ms) {
     std::vector<PeerId> voters;
-    conf.list_peers(&voters);
+    conf.list_voters(&voters);
     size_t alive_count = 0;
     Configuration dead_nodes;  // for easily print
     for (size_t i = 0; i < voters.size(); i++) {
@@ -1858,11 +1858,11 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     }
 
     _pre_vote_ctx.init(this, triggered);
-    std::set<PeerId> peers;
-    _conf.list_peers(&peers);
+    std::set<PeerId> voters;
+    _conf.list_voters(&voters);
 
     for (std::set<PeerId>::const_iterator
-            iter = peers.begin(); iter != peers.end(); ++iter) {
+            iter = voters.begin(); iter != voters.end(); ++iter) {
         if (*iter == _server_id) {
             continue;
         }
@@ -1949,9 +1949,9 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
     }
     _vote_ctx.set_last_log_id(last_log_id);
 
-    std::set<PeerId> peers;
-    _conf.list_peers(&peers);
-    request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
+    std::set<PeerId> voters;
+    _conf.list_voters(&voters);
+    request_peers_to_vote(voters, _vote_ctx.disrupted_leader());
 
     //TODO: outof lock
     status = _meta_storage->
@@ -3667,21 +3667,21 @@ void NodeImpl::check_majority_nodes_readonly() {
 }
 
 void NodeImpl::check_majority_nodes_readonly(const Configuration& conf) {
-    std::vector<PeerId> peers;
-    conf.list_peers(&peers);
+    std::vector<PeerId> voters;
+    conf.list_voters(&voters);
     size_t readonly_nodes = 0;
-    for (size_t i = 0; i < peers.size(); i++) {
-        if (peers[i] == _server_id) {
+    for (size_t i = 0; i < voters.size(); i++) {
+        if (voters[i] == _server_id) {
             readonly_nodes += ((_node_readonly) ? 1: 0);
             continue;
         }
-        if (_replicator_group.readonly(peers[i])) {
+        if (_replicator_group.readonly(voters[i])) {
             ++readonly_nodes;
         }
     }
-    size_t writable_nodes = peers.size() - readonly_nodes;
+    size_t writable_nodes = voters.size() - readonly_nodes;
     bool prev_readonly = _majority_nodes_readonly;
-    _majority_nodes_readonly = !(writable_nodes >= (peers.size() / 2 + 1));
+    _majority_nodes_readonly = !(writable_nodes >= (voters.size() / 2 + 1));
     if (prev_readonly != _majority_nodes_readonly) {
         LOG(INFO) << "node " << _group_id << ":" << _server_id 
                   << " majority readonly change from " << (prev_readonly ? "enable" : "disable")
